@@ -11,12 +11,18 @@
 cargo install sbpf-linker
 ```
 
-### Upstream Gallery: Early Feature Gate
+### LLVM Main: Early Feature Gate
 
-Integrates the latest LLVM commits from the Blueshift LLVM fork to experiment with upcoming changes during the upstreaming process. `cargo install-with-gallery` detects the LLVM major from `rustup run nightly rustc -vV` and clones the matching gallery branch, currently [`upstream-gallery-21`](https://github.com/blueshift-gg/llvm-project/tree/upstream-gallery-21) or [`upstream-gallery-22`](https://github.com/blueshift-gg/llvm-project/tree/upstream-gallery-22), before building sbpf-linker with static LLVM linking.
+Builds and installs sbpf-linker against a cached [`llvm/llvm-project`](https://github.com/llvm/llvm-project) `main` checkout with static LLVM linking. The install command reuses the cached LLVM checkout and build when available.
 
 ```sh
-cargo install-with-gallery 
+cargo install-with-llvm-main
+```
+
+Update the cached LLVM checkout and rebuild LLVM separately when you want to move to the latest `main`.
+
+```sh
+cargo update-llvm-main
 ```
 
 ### Generate a Program

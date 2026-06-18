@@ -1,46 +1,35 @@
-use std::{ffi::OsString, fs, path::PathBuf, process::Command};
+use std::{
+    ffi::OsString,
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use anyhow::{Context, Result};
 
-const LLVM_REPO: &str = "https://github.com/blueshift-gg/llvm-project.git";
+const LLVM_REPO: &str = "https://github.com/llvm/llvm-project.git";
+const LLVM_BRANCH: &str = "main";
+const LLVM_CACHE_KEY: &str = "llvm-main";
 const GIT_DEPTH: &str = "1";
-const NIGHTLY_TOOLCHAIN: &str = "nightly";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct GalleryRelease {
-    cargo_feature: &'static str,
-    llvm_branch: &'static str,
-}
-
-impl GalleryRelease {
-    const fn upstream_gallery_21() -> Self {
-        Self {
-            cargo_feature: "upstream-gallery-21",
-            llvm_branch: "upstream-gallery-21",
-        }
-    }
-
-    const fn upstream_gallery_22() -> Self {
-        Self {
-            cargo_feature: "upstream-gallery-22",
-            llvm_branch: "upstream-gallery-22",
-        }
-    }
-
-    fn from_llvm_major(llvm_major: u32) -> Result<Self> {
-        match llvm_major {
-            21 => Ok(Self::upstream_gallery_21()),
-            22 => Ok(Self::upstream_gallery_22()),
-            other => anyhow::bail!(
-                "unsupported rustc LLVM major version `{other}`; expected one of: 21, 22"
-            ),
-        }
-    }
+enum CommandName {
+    Install,
+    UpdateLlvm,
 }
 
 fn main() -> Result<()> {
-    let gallery = detect_gallery_release()?;
-    build(gallery)
+    let command = match std::env::args().nth(1).as_deref() {
+        None | Some("install") => CommandName::Install,
+        Some("update-llvm") => CommandName::UpdateLlvm,
+        Some(argument) => anyhow::bail!(
+            "unexpected argument `{argument}`; expected one of: install, update-llvm"
+        ),
+    };
+
+    match command {
+        CommandName::Install => install(),
+        CommandName::UpdateLlvm => update_llvm(),
+    }
 }
 
 fn project_root() -> Result<PathBuf> {
@@ -56,134 +45,131 @@ fn project_root() -> Result<PathBuf> {
     }
 }
 
-fn cache_dir(gallery: GalleryRelease) -> PathBuf {
+fn cache_dir() -> PathBuf {
     // Build tools outside the project to avoid Cargo workspace issues
     dirs::cache_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(format!("sbpf-linker-{}", gallery.llvm_branch))
+        .join(format!("sbpf-linker-{LLVM_CACHE_KEY}"))
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct RustcVersionInfo {
-    release: String,
-    llvm_version: String,
-    llvm_major: u32,
+fn clone_llvm_checkout(llvm_src_dir: &Path) -> Result<()> {
+    println!("============================================");
+    println!(
+        "[1/2] Cloning {} {} into {}",
+        LLVM_REPO,
+        LLVM_BRANCH,
+        llvm_src_dir.display()
+    );
+    println!("============================================");
+    run_command(
+        Command::new("git")
+            .args([
+                "clone",
+                "--depth",
+                GIT_DEPTH,
+                "--branch",
+                LLVM_BRANCH,
+                LLVM_REPO,
+            ])
+            .arg(llvm_src_dir),
+        "clone llvm-project",
+    )
 }
 
-fn parse_rustc_version_info(stdout: &str) -> Result<RustcVersionInfo> {
-    let release = stdout
-        .lines()
-        .find_map(|line| line.strip_prefix("release: "))
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!("missing `release:` in `rustc -vV` output")
-        })?
-        .to_string();
-
-    let llvm_version = stdout
-        .lines()
-        .find_map(|line| line.strip_prefix("LLVM version: "))
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!("missing `LLVM version:` in `rustc -vV` output")
-        })?
-        .to_string();
-
-    let llvm_major = llvm_version
-        .split('.')
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("missing LLVM major version"))?
-        .parse::<u32>()?;
-
-    Ok(RustcVersionInfo { release, llvm_version, llvm_major })
-}
-
-fn detect_gallery_release() -> Result<GalleryRelease> {
-    let output = Command::new("rustup")
-        .args(["run", NIGHTLY_TOOLCHAIN, "rustc", "-vV"])
-        .output()
-        .with_context(|| {
-            format!("failed to run `rustup run {NIGHTLY_TOOLCHAIN} rustc -vV`")
-        })?;
-
-    if !output.status.success() {
-        anyhow::bail!(
-            "`rustup run {NIGHTLY_TOOLCHAIN} rustc -vV` failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+fn ensure_llvm_checkout(llvm_src_dir: &Path) -> Result<bool> {
+    if !llvm_src_dir.exists() {
+        println!(
+            "LLVM checkout not found at {}; cloning it",
+            llvm_src_dir.display()
         );
+        clone_llvm_checkout(llvm_src_dir)?;
+        return Ok(true);
     }
 
-    let rustc = parse_rustc_version_info(
-        String::from_utf8_lossy(&output.stdout).as_ref(),
-    )?;
-    let gallery = GalleryRelease::from_llvm_major(rustc.llvm_major).with_context(|| {
-        format!(
-            "{NIGHTLY_TOOLCHAIN} rustc {} uses LLVM {}; no matching upstream gallery branch is configured",
-            rustc.release,
-            rustc.llvm_version
-        )
-    })?;
-
     println!(
-        "Using {} for {NIGHTLY_TOOLCHAIN} rustc {} (LLVM {})",
-        gallery.llvm_branch, rustc.release, rustc.llvm_version
+        "Using existing LLVM checkout at {}; skipping update",
+        llvm_src_dir.display()
     );
-
-    Ok(gallery)
+    Ok(false)
 }
 
-fn build(gallery: GalleryRelease) -> Result<()> {
-    let base_dir = cache_dir(gallery);
+fn update_llvm_checkout(llvm_src_dir: &Path) -> Result<bool> {
+    if !llvm_src_dir.exists() {
+        clone_llvm_checkout(llvm_src_dir)?;
+        return Ok(true);
+    }
+
+    let previous_head = command_stdout(
+        Command::new("git")
+            .args(["-C"])
+            .arg(llvm_src_dir)
+            .args(["rev-parse", "HEAD"]),
+        "read llvm-project HEAD",
+    )?;
+
+    println!(
+        "Updating {} from {} {}",
+        llvm_src_dir.display(),
+        LLVM_REPO,
+        LLVM_BRANCH
+    );
+    run_command(
+        Command::new("git").args(["-C"]).arg(llvm_src_dir).args([
+            "pull",
+            "--ff-only",
+            "origin",
+            LLVM_BRANCH,
+        ]),
+        "update llvm-project",
+    )?;
+
+    let current_head = command_stdout(
+        Command::new("git")
+            .args(["-C"])
+            .arg(llvm_src_dir)
+            .args(["rev-parse", "HEAD"]),
+        "read updated llvm-project HEAD",
+    )?;
+
+    Ok(previous_head != current_head)
+}
+
+struct LlvmPaths {
+    src_dir: PathBuf,
+    build_dir: PathBuf,
+    install_dir: PathBuf,
+    config: PathBuf,
+}
+
+fn llvm_paths() -> Result<LlvmPaths> {
+    let base_dir = cache_dir();
     std::fs::create_dir_all(&base_dir)?;
-    let llvm_src_dir = base_dir.join("llvm-project");
-    let llvm_build_dir = base_dir.join("llvm-build");
-    let llvm_install_dir = base_dir.join("llvm-install");
-    let llvm_config = llvm_install_dir.join("bin/llvm-config");
+    let src_dir = base_dir.join("llvm-project");
+    let build_dir = base_dir.join("llvm-build");
+    let install_dir = base_dir.join("llvm-install");
+    let config = install_dir.join("bin/llvm-config");
 
-    if !llvm_config.exists() {
-        if llvm_src_dir.exists() {
-            println!(
-                "llvm-project directory already exists ({}), skipping clone",
-                llvm_src_dir.display()
-            );
-        } else {
-            println!("============================================");
-            println!(
-                "[1/2] Cloning {} from the Blueshift LLVM fork into {}",
-                gallery.llvm_branch,
-                llvm_src_dir.display()
-            );
-            println!("============================================");
-            run_command(
-                Command::new("git")
-                    .args([
-                        "clone",
-                        "--depth",
-                        GIT_DEPTH,
-                        "--branch",
-                        gallery.llvm_branch,
-                        LLVM_REPO,
-                    ])
-                    .arg(&llvm_src_dir),
-                "clone llvm-project",
-            )?;
-        }
+    Ok(LlvmPaths { src_dir, build_dir, install_dir, config })
+}
 
-        if !llvm_build_dir.exists() {
-            fs::create_dir_all(&llvm_build_dir).with_context(|| {
+fn build_llvm_if_needed(
+    paths: &LlvmPaths,
+    checkout_changed: bool,
+) -> Result<()> {
+    if !paths.config.exists() || checkout_changed {
+        if !paths.build_dir.exists() {
+            fs::create_dir_all(&paths.build_dir).with_context(|| {
                 format!(
                     "failed to create build dir {}",
-                    llvm_build_dir.display()
+                    paths.build_dir.display()
                 )
             })?;
         }
-        if !llvm_install_dir.exists() {
-            fs::create_dir_all(&llvm_install_dir).with_context(|| {
+        if !paths.install_dir.exists() {
+            fs::create_dir_all(&paths.install_dir).with_context(|| {
                 format!(
                     "failed to create install prefix {}",
-                    llvm_install_dir.display()
+                    paths.install_dir.display()
                 )
             })?;
         }
@@ -191,15 +177,15 @@ fn build(gallery: GalleryRelease) -> Result<()> {
         if cfg!(target_os = "macos") {
             ensure_brew_dependencies()?;
         }
-        // Build flags tuned for the upstream gallery fork.
+        // Build only the LLVM components needed by sbpf-linker.
         let mut install_arg = OsString::from("-DCMAKE_INSTALL_PREFIX=");
-        install_arg.push(llvm_install_dir.as_os_str());
+        install_arg.push(paths.install_dir.as_os_str());
         let mut cmake_configure = Command::new("cmake");
         let cmake_configure = cmake_configure
             .arg("-S")
-            .arg(llvm_src_dir.join("llvm"))
+            .arg(paths.src_dir.join("llvm"))
             .arg("-B")
-            .arg(&llvm_build_dir)
+            .arg(&paths.build_dir)
             .args([
                 "-G",
                 "Ninja",
@@ -232,7 +218,7 @@ fn build(gallery: GalleryRelease) -> Result<()> {
         let mut cmake_build = Command::new("cmake");
         let cmake_build = cmake_build
             .arg("--build")
-            .arg(llvm_build_dir)
+            .arg(&paths.build_dir)
             .args(["--target", "install"])
             // Create symlinks rather than copies to conserve disk space,
             // especially on GitHub-hosted runners.
@@ -253,43 +239,53 @@ fn build(gallery: GalleryRelease) -> Result<()> {
 
         // Confirmation log to show which llvm-config was used.
         // This is just a cosmetic to make sure it worked.
-        let llvm_config = llvm_install_dir.join("bin").join("llvm-config");
-        if llvm_config.exists() {
-            let output = Command::new(&llvm_config)
+        if paths.config.exists() {
+            let output = Command::new(&paths.config)
                 .arg("--version")
                 .output()
                 .with_context(|| {
                     format!(
                         "failed to run {} --version",
-                        llvm_config.display()
+                        paths.config.display()
                     )
                 })?;
             let version = String::from_utf8_lossy(&output.stdout);
             println!(
                 "LLVM config: {} ({})",
-                llvm_config.display(),
+                paths.config.display(),
                 version.trim()
             );
         } else {
-            println!("LLVM config not found at {}", llvm_config.display());
+            println!("LLVM config not found at {}", paths.config.display());
         }
     } else {
         println!(
             "LLVM already cloned and built (found {}), skipping",
-            llvm_config.display()
+            paths.config.display()
         );
     }
+
+    Ok(())
+}
+
+fn install() -> Result<()> {
+    let paths = llvm_paths()?;
+    let checkout_changed = ensure_llvm_checkout(&paths.src_dir)?;
+    build_llvm_if_needed(&paths, checkout_changed)?;
 
     println!("============================================");
     println!("[2/2] Building the linker");
     println!("============================================");
-    build_linker(gallery, &llvm_install_dir)
+    build_linker(&paths.install_dir)
 }
 
-fn build_linker(
-    gallery: GalleryRelease,
-    llvm_install_dir: &PathBuf,
-) -> Result<()> {
+fn update_llvm() -> Result<()> {
+    let paths = llvm_paths()?;
+    let checkout_changed = update_llvm_checkout(&paths.src_dir)?;
+    build_llvm_if_needed(&paths, checkout_changed)
+}
+
+fn build_linker(llvm_install_dir: &Path) -> Result<()> {
     let project_root = project_root()?;
 
     let mut cmd = Command::new("cargo");
@@ -360,7 +356,7 @@ fn build_linker(
         ".",
         "--no-default-features",
         "--features",
-        &format!("{},bpf-linker/llvm-link-static", gallery.cargo_feature),
+        "bpf-linker/llvm-22,bpf-linker/llvm-link-static",
         "--force",
     ])
     .env("LLVM_PREFIX", llvm_install_dir)
@@ -370,47 +366,19 @@ fn build_linker(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{GalleryRelease, RustcVersionInfo, parse_rustc_version_info};
+fn command_stdout(cmd: &mut Command, description: &str) -> Result<String> {
+    let output = cmd
+        .output()
+        .with_context(|| format!("failed to run: {description}"))?;
 
-    #[test]
-    fn parses_rustc_version_output_for_llvm_21() {
-        let stdout = "\
-rustc 1.94.0 (4a4ef493e 2026-03-02)
-binary: rustc
-commit-hash: 4a4ef493e3a1488c6e321570238084b38948f6db
-commit-date: 2026-03-02
-host: aarch64-apple-darwin
-release: 1.94.0
-LLVM version: 21.1.8
-";
-
-        assert_eq!(
-            parse_rustc_version_info(stdout).unwrap(),
-            RustcVersionInfo {
-                release: "1.94.0".to_string(),
-                llvm_version: "21.1.8".to_string(),
-                llvm_major: 21,
-            }
+    if !output.status.success() {
+        anyhow::bail!(
+            "command failed: {description}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
         );
     }
 
-    #[test]
-    fn maps_llvm_21_to_gallery_21() {
-        assert_eq!(
-            GalleryRelease::from_llvm_major(21).unwrap(),
-            GalleryRelease::upstream_gallery_21()
-        );
-    }
-
-    #[test]
-    fn maps_llvm_22_to_gallery_22() {
-        assert_eq!(
-            GalleryRelease::from_llvm_major(22).unwrap(),
-            GalleryRelease::upstream_gallery_22()
-        );
-    }
+    Ok(String::from_utf8(output.stdout)?.trim().to_string())
 }
 
 fn run_command(cmd: &mut Command, description: &str) -> Result<()> {
